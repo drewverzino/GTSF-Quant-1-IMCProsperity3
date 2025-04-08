@@ -1,70 +1,66 @@
-from datamodel import Order, OrderDepth, TradingState
+from datamodel import OrderDepth, Order, TradingState
 from typing import Dict, List
-import jsonpickle
-import statistics as stats
+import statistics
 
+POSITION_LIMITS = {
+    "KELP": 50,
+    "RAINFOREST_RESIN": 50
+}
 
 class Trader:
-    LIMITS = {"RAINFOREST_RESIN": 50, "KELP": 50}
-    ALPHA = 0.2
-    BASE_EDGE = 2
-    VOL_WINDOW = 20
-    INV_SKEW = 0.04
-    PASSIVE_SIZE = 3          # qty posted on each side
-
-    @staticmethod
-    def _best(depth: OrderDepth):
-        bid = max(depth.buy_orders.items()) if depth.buy_orders else (None, 0)
-        ask = min(depth.sell_orders.items()
-                  ) if depth.sell_orders else (None, 0)
-        return bid, ask
+    def __init__(self):
+        self.kelp_prices = []
 
     def run(self, state: TradingState):
-        mem = jsonpickle.decode(state.traderData) if state.traderData else {}
-        results: Dict[str, List[Order]] = {}
+        result = {}
+        conversions = 0
+        traderData = ""
 
-        for prod, depth in state.order_depths.items():
-            (bid_px, bid_qty), (ask_px, ask_qty) = self._best(depth)
-            if bid_px is None or ask_px is None:
-                continue
-            mid = (bid_px + ask_px) / 2
-
-            # ── rolling stats & fair value ────────────────────────────────
-            roll = mem.setdefault("roll", {}).setdefault(prod, [])
-            roll.append(mid)
-            roll[-self.VOL_WINDOW:]
-            fv_prev = mem.setdefault("fv", {}).get(prod, mid)
-            fv = self.ALPHA * mid + (1 - self.ALPHA) * fv_prev
-            mem["fv"][prod] = fv
-            sigma = stats.stdev(roll) if len(roll) > 5 else 0
-            edge = self.BASE_EDGE + 0.5 * sigma
-
-            pos, lim = state.position.get(prod, 0), self.LIMITS[prod]
-            skew = self.INV_SKEW * (pos / lim) * edge * 2
-            bid_target = round(fv - edge - skew)
-            ask_target = round(fv + edge - skew)
-
+        for product, order_depth in state.order_depths.items():
             orders: List[Order] = []
+            position = state.position.get(product, 0)
 
-            # ── 1. cross the spread when advantageous ────────────────────
-            if ask_px < bid_target and pos < lim:
-                qty = min(-ask_qty, lim - pos)
-                orders.append(Order(prod, ask_px, qty))
-            if bid_px > ask_target and pos > -lim:
-                qty = min(bid_qty, lim + pos)
-                orders.append(Order(prod, bid_px, -qty))
+            if product == "RAINFOREST_RESIN":
+                # Tight-spread market making on stable asset
+                if order_depth.buy_orders and order_depth.sell_orders:
+                    best_bid = max(order_depth.buy_orders.keys())
+                    best_ask = min(order_depth.sell_orders.keys())
+                    mid_price = (best_bid + best_ask) / 2
 
-            # ── 2. always quote passively at fv±edge ─────────────────────
-            # cancel/replace logic is unnecessary – engine cancels resting
-            passive_bid_qty = min(self.PASSIVE_SIZE, lim - pos)
-            passive_ask_qty = min(self.PASSIVE_SIZE, lim + pos)
-            if passive_bid_qty > 0:
-                orders.append(Order(prod, bid_target, passive_bid_qty))
-            if passive_ask_qty > 0:
-                orders.append(Order(prod, ask_target, -passive_ask_qty))
+                    buy_price = best_bid + 1  # be more aggressive
+                    sell_price = best_ask - 1
 
-            results[prod] = orders
-            print(f"{state.timestamp} {prod} fv={fv:.1f} "
-                  f"bidT={bid_target} askT={ask_target} pos={pos}")
+                    buy_volume = min(POSITION_LIMITS[product] - position, 5)
+                    sell_volume = min(POSITION_LIMITS[product] + position, 5)
 
-        return results, 0, jsonpickle.encode(mem)
+                    if buy_volume > 0:
+                        orders.append(Order(product, buy_price, buy_volume))
+                    if sell_volume > 0:
+                        orders.append(Order(product, sell_price, -sell_volume))
+
+            elif product == "KELP":
+                # Mean reversion strategy
+                if order_depth.buy_orders and order_depth.sell_orders:
+                    best_bid = max(order_depth.buy_orders.keys())
+                    best_ask = min(order_depth.sell_orders.keys())
+                    mid_price = (best_ask + best_bid) / 2
+                    self.kelp_prices.append(mid_price)
+
+                    window = 5
+                    if len(self.kelp_prices) >= window:
+                        moving_avg = statistics.mean(self.kelp_prices[-window:])
+                        threshold = 1  # small deviation threshold
+
+                        # Buy low (undervalued)
+                        if mid_price < moving_avg - threshold and position < POSITION_LIMITS[product]:
+                            buy_volume = min(POSITION_LIMITS[product] - position, 10)
+                            orders.append(Order(product, best_ask, buy_volume))
+
+                        # Sell high (overvalued)
+                        elif mid_price > moving_avg + threshold and position > -POSITION_LIMITS[product]:
+                            sell_volume = min(position + POSITION_LIMITS[product], 10)
+                            orders.append(Order(product, best_bid, -sell_volume))
+
+            result[product] = orders
+
+        return result, conversions, traderData
